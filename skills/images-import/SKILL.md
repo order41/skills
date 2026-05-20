@@ -1,50 +1,51 @@
 ---
-name: gdrive-image-optimizer
+name: gdrive-csv-image-matcher
 description: >
-  Checks Google Drive connectivity, lets the user pick a folder, converts all images in that folder to JPEG at max 2000×2000px resolution, saves them into a new copy of the folder, and returns a list of direct-access URLs using the https://lh3.googleusercontent.com/d/FILE_ID pattern. Always use this skill when the user wants to compress, convert, or resize images stored in Google Drive, export Drive images as JPEGs, create a web-friendly copy of a Drive image folder, or generate direct image URLs from Google Drive. Trigger for phrases like "optimize my Drive images", "convert Drive folder to JPEG", "resize images in Google Drive", "get image URLs from Drive", or "make a web copy of my Drive folder".
-compatibility:
-  tools:
-    - google_drive_search (MCP)
-    - google_drive_fetch (MCP)
-    - bash_tool
-  python_packages:
-    - Pillow (PIL)
-    - requests
+  Accesses a Google Drive folder, reads all image filenames, matches them against names in a CSV file, and writes image URLs back into the matching CSV rows. Always use this skill when the user wants to match Google Drive images to a spreadsheet or CSV by name, add Drive image URLs to a CSV, link images to product rows, or populate a CSV with image URLs from a Drive folder. Trigger for phrases like "match images from Drive to my CSV", "add image URLs to my spreadsheet", "link Drive photos to my product list", "fill in image URLs from Google Drive", "match folder images to CSV rows", or any request combining a Google Drive folder, image files, and a CSV or spreadsheet.
+compatibility: "Requires Google Drive MCP connection, bash_tool, and pandas Python package."
 ---
 
-# Google Drive Image Optimizer
+# Google Drive CSV Image Matcher
 
-Converts all images in a Google Drive folder to JPEG at ≤ 2000×2000 px, saves them to a new sibling folder, and returns a list of direct-access `lh3.googleusercontent.com` URLs.
+Reads all image filenames from a Google Drive folder, matches them by name against rows in a CSV file, and writes a Google Drive direct-access URL into the matching CSV rows.
+
+---
+
+## Step 0 — Understand the inputs
+
+Before doing anything, confirm you have or can get:
+
+1. **The Google Drive folder** — name, link, or folder ID containing the images
+2. **The CSV file** — uploaded by the user OR a path/Drive link to it
+3. **The name column** in the CSV — which column holds the names to match against image filenames
+
+If any of these are unclear, ask the user before proceeding. Example:
+
+> "Got it! To match images to your CSV I need three things:
+> 1. The Google Drive folder name (or link) that contains the images
+> 2. Your CSV file — please upload it or share a link
+> 3. Which column in the CSV has the names I should match against? (e.g., 'product_name', 'sku', 'title')"
 
 ---
 
 ## Step 1 — Verify Google Drive connection
 
-Before doing anything else, confirm the user has Google Drive connected.
-
-Use the `tool_search` tool to find the Google Drive MCP tools:
+Use `tool_search` to confirm Google Drive MCP tools are available:
 
 ```
-tool_search(query="google drive list files")
+tool_search(query="google drive list files search")
 ```
 
-If no Google Drive tools are returned, stop and tell the user:
+If no tools are returned, tell the user:
 
-> "It looks like Google Drive isn't connected. Please go to **Settings → Integrations** in Claude.ai and connect your Google Drive account, then try again."
-
-If the tools are available, proceed.
+> "Google Drive isn't connected. Please go to **Settings → Integrations** in Claude.ai and connect your Google Drive, then try again."
 
 ---
 
-## Step 2 — Ask the user which folder to use
-
-Ask the user to name the Google Drive folder they want to process. For example:
-
-> "Which Google Drive folder should I optimize? Please share the folder name (or paste a link/folder ID if you have it)."
-
-Once you have a name or ID:
+## Step 2 — Find and confirm the Drive folder
 
 **If the user gave a folder name**, search for it:
+
 ```
 google_drive_search(
   api_query="name = 'FOLDER_NAME' and mimeType = 'application/vnd.google-apps.folder'",
@@ -52,17 +53,15 @@ google_drive_search(
 )
 ```
 
-**If multiple folders match**, list them and ask the user to confirm which one.
+**If multiple folders match**, list them and ask the user to pick one.
 
-**If no folder is found**, let the user know and ask them to double-check the name.
-
-Note the confirmed folder's **ID** and **name** — you'll need both.
+Note the confirmed folder's **ID** and **name**.
 
 ---
 
 ## Step 3 — List all images in the folder
 
-Search for image files inside the confirmed folder:
+Search for image files in the folder:
 
 ```
 google_drive_search(
@@ -73,141 +72,179 @@ google_drive_search(
     mimeType = 'image/gif' or
     mimeType = 'image/bmp' or
     mimeType = 'image/tiff' or
-    mimeType = 'image/heic'
+    mimeType = 'image/heic' or
+    mimeType = 'image/avif'
   )",
-  semantic_query="images in folder"
+  semantic_query="images photos in folder"
 )
 ```
 
-Collect for each image:
+For each image, collect:
 - `file_id`
-- `file_name`
-- `mimeType`
+- `file_name` (full name with extension)
+- `name_stem` — filename **without extension** (used for matching)
 
-If no images are found, let the user know and stop.
-
-Tell the user how many images were found before proceeding:
-
-> "Found **N images** in '[Folder Name]'. I'll convert them all to JPEG at max 2000×2000 px and save them to a new folder called '[Folder Name] – Optimized'."
-
----
-
-## Step 4 — Download, convert, and re-upload images
-
-### 4a — Install Pillow if needed
-
-```bash
-pip install Pillow requests --break-system-packages -q
-```
-
-### 4b — Download each image
-
-Use `google_drive_fetch` (or the equivalent MCP download tool) to get each file's binary content.
-
-If the MCP tool returns base64-encoded content, decode it in Python before processing.
-
-### 4c — Convert and resize with Python
-
-For each image, run this logic:
+Build a lookup dict in memory — use a **list** of file IDs per key to support multiple images sharing the same name:
 
 ```python
-from PIL import Image
-import io, os
+from collections import defaultdict
+import os
 
-MAX_SIZE = (2000, 2000)
+# e.g. {"sunset-photo": ["FILE_ID_123", "FILE_ID_789"], "product-hero": ["FILE_ID_456"]}
+image_map = defaultdict(list)
+image_map_fuzzy = defaultdict(list)
 
-def convert_image(input_bytes: bytes, original_name: str) -> tuple[bytes, str]:
-    """Convert image to JPEG, resize to fit within 2000x2000, return bytes + new filename."""
-    img = Image.open(io.BytesIO(input_bytes))
-
-    # Convert palette/RGBA/LA modes to RGB for JPEG compatibility
-    if img.mode in ("RGBA", "LA", "P"):
-        background = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
-        img = background
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-
-    # Resize only if larger than the max
-    img.thumbnail(MAX_SIZE, Image.LANCZOS)
-
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=88, optimize=True)
-    out.seek(0)
-
-    # Replace extension with .jpg
-    stem = os.path.splitext(original_name)[0]
-    new_name = stem + ".jpg"
-    return out.read(), new_name
+for f in drive_images:
+    stem = os.path.splitext(f["name"])[0]
+    key = stem.strip().lower()
+    key_fuzzy = key.replace("-", "").replace("_", "").replace(" ", "")
+    image_map[key].append(f["id"])
+    image_map_fuzzy[key_fuzzy].append(f["id"])
 ```
 
-### 4d — Create the destination folder
+Tell the user how many images were found:
 
-Using the Google Drive MCP tool, create a new folder in the **same parent** as the source folder:
-
-- Name: `[Original Folder Name] – Optimized`
-
-Note the new folder's **ID**.
-
-### 4e — Upload each converted image
-
-Upload each converted JPEG to the new folder using the Google Drive MCP create/upload tool.
-
-After uploading, note each file's **new file ID** returned by the API.
+> "Found **N images** in '[Folder Name]'."
 
 ---
 
-## Step 5 — Build and return the URL list
+## Step 4 — Load the CSV
 
-For each uploaded file, construct the direct-access URL:
+If the user uploaded the CSV, read it from `/mnt/user-data/uploads/`:
+
+```python
+import pandas as pd
+df = pd.read_csv("/mnt/user-data/uploads/FILENAME.csv")
+print(df.columns.tolist())
+print(df.head())
+```
+
+If the user provided a Google Drive link or file ID, fetch it:
 
 ```
-https://lh3.googleusercontent.com/d/FILE_ID
+google_drive_search(api_query="name = 'FILENAME.csv'", semantic_query="csv file")
 ```
+Then use `Google Drive:read_file_content` or `Google Drive:download_file_content` to get the data.
 
-> **Note:** These URLs work for files that are shared as "Anyone with the link can view." If the files are private, the URLs will require the viewer to be logged into a Google account that has access. Remind the user of this.
+Confirm the column name that holds the names to match against (e.g., `product_name`). If unsure, show the user the column headers and ask.
 
-Present the results clearly:
+The output column name is always **`parent image_urls (seperated by comma)`** — do not ask the user about this.
 
 ---
 
-### ✅ Done — [N] images optimized
+## Step 5 — Match names and build URL column
 
-Saved to Google Drive folder: **[Folder Name] – Optimized**
+### Matching strategy
 
-| # | Original filename | New filename | URL |
-|---|---|---|---|
-| 1 | photo1.png | photo1.jpg | https://lh3.googleusercontent.com/d/ABC123 |
-| 2 | banner.webp | banner.jpg | https://lh3.googleusercontent.com/d/DEF456 |
-| … | … | … | … |
+Use **case-insensitive, trimmed** matching between the CSV name column and image filename stems.
+
+Optionally, also try fuzzy matching if exact match fails — strip common separators (`-`, `_`, spaces) before comparing as a fallback.
+
+```python
+import os
+import pandas as pd
+from collections import defaultdict
+
+URL_TEMPLATE = "https://lh3.googleusercontent.com/d/{file_id}"
+
+# Output column is always fixed:
+OUTPUT_COL = "parent image_urls (seperated by comma)"
+
+def normalize(s):
+    return str(s).strip().lower()
+
+def normalize_fuzzy(s):
+    return normalize(s).replace("-", "").replace("_", "").replace(" ", "")
+
+# image_map and image_map_fuzzy are defaultdict(list) built in Step 3
+# Each key maps to a LIST of file IDs (handles multiple images with the same name)
+
+urls = []
+match_log = []  # for the summary
+
+for val in df[name_column]:
+    key = normalize(str(val))
+    key_fuzzy = normalize_fuzzy(str(val))
+
+    if key in image_map and image_map[key]:
+        file_ids = image_map[key]
+        # Join all matching URLs with a comma separator
+        cell = ",".join(URL_TEMPLATE.format(file_id=fid) for fid in file_ids)
+        urls.append(cell)
+        match_log.append((val, "exact", len(file_ids)))
+    elif key_fuzzy in image_map_fuzzy and image_map_fuzzy[key_fuzzy]:
+        file_ids = image_map_fuzzy[key_fuzzy]
+        cell = ",".join(URL_TEMPLATE.format(file_id=fid) for fid in file_ids)
+        urls.append(cell)
+        match_log.append((val, "fuzzy", len(file_ids)))
+    else:
+        urls.append("")   # no match — leave blank
+        match_log.append((val, "no match", 0))
+
+df[OUTPUT_COL] = urls
+```
 
 ---
 
-Also offer to copy just the URLs as a plain list if the user needs them for another tool.
+## Step 6 — Save the updated CSV
+
+Save the updated file locally and present it to the user:
+
+```python
+output_path = "/mnt/user-data/outputs/updated_with_images.csv"
+df.to_csv(output_path, index=False)
+```
+
+Then call `present_files(filepaths=[output_path])`.
+
+---
+
+## Step 7 — Show a summary
+
+After saving, report results clearly:
+
+> **✅ Done — X / Y rows matched**
+>
+> | Status | Count |
+> |--------|-------|
+> | Exact match | N |
+> | Fuzzy match | N |
+> | No match | N |
+
+If there are unmatched rows, list up to 10 of the unmatched names so the user can investigate:
+
+> "These names had no matching image:
+> - `widget-blue`
+> - `logo final`
+> - …"
+
+Remind the user:
+
+> ⚠️ The `lh3.googleusercontent.com` URLs require the Drive folder to be shared as **"Anyone with the link can view"** to be publicly accessible. You can set this in Google Drive's sharing settings.
 
 ---
 
 ## Edge cases
 
 | Situation | How to handle |
-|---|---|
-| Image is already a JPEG under 2000×2000 px | Still re-upload to the new folder; skip re-encoding to avoid quality loss — copy as-is |
-| File with `.jpg` extension is actually another format | Pillow detects the real format on open; proceed normally |
-| Animated GIF | Convert only the first frame to JPEG; warn the user animation will be lost |
-| HEIC files | Pillow may not support HEIC without `pillow-heif`; install it with `pip install pillow-heif --break-system-packages` and register the opener: `from pillow_heif import register_heif_opener; register_heif_opener()` |
-| Download fails for a file | Skip it, log the filename, and note it in the final summary |
-| Folder has subfolders | Process only the top-level folder unless the user explicitly asks to recurse |
-| Very large number of images (50+) | Warn the user it may take a while; process in batches of 10 and show progress |
+|-----------|---------------|
+| CSV has no header row | Ask the user which column index (0-based) holds the names |
+| Output column already exists in CSV | Ask the user whether to overwrite or use a new column name |
+| Multiple images match the same name | Collect **all** matching file IDs; join their URLs with `,` into a single cell in the `parent image_urls (seperated by comma)` column |
+| Filename has multiple dots (e.g. `my.product.v2.jpg`) | Strip only the last extension: `os.path.splitext` handles this correctly |
+| Folder has subfolders | Process only top-level images unless user asks to recurse |
+| 50+ images | Warn it may take a moment; paginate Drive searches if needed |
+| CSV is very large (10k+ rows) | Use pandas for efficiency; avoid row-by-row loops |
+| User wants URLs in a different format | Ask: Google Drive direct link (`lh3`), export link (`drive.google.com/file/d/ID/view`), or download link (`drive.google.com/uc?id=ID`) |
 
 ---
 
-## Important notes on URL accessibility
+## URL format
 
-The `lh3.googleusercontent.com/d/FILE_ID` URL pattern serves files directly from Google's CDN. For the URLs to work publicly:
+All URLs use the Google Drive CDN direct-access pattern:
 
-1. The file (or its parent folder) must be shared with **"Anyone with the link"** in Google Drive.
-2. Without that permission, the URL will redirect to a Google login or return a 403 error.
+```
+https://lh3.googleusercontent.com/d/FILE_ID
+```
 
-If the user wants the URLs to be publicly accessible, remind them to set the folder sharing to **"Anyone with the link can view"** in Google Drive after the upload completes — this is a sharing permission change that the user must do themselves.
+This is the only format used. If a row matches multiple images, all URLs are joined with `,` (no space) in a single cell.
