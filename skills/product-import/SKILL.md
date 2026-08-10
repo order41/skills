@@ -27,7 +27,7 @@ You are helping the user create an Order41-compatible import CSV file from uploa
 
 One row per variant. The header must be exactly:
 
-parent_urlkey,variant_id,variant_row_order,name,info,type,parent_sku,sku,inventory_stock,cost,cost_currency,wholesale_price,MSRP,currency,Size,Color,Delivery,GTIN,Material,Fiber,Origin,Taric,Delivery_date,parent_image_urls,image_urls
+parent_urlkey,variant_id,variant_row_order,name,info,type,parent_sku,sku,location_id,inventory_stock,cost,cost_currency,wholesale_price,MSRP,currency,Size,Color,Delivery,GTIN,Material,Fiber,Origin,Taric,Delivery_date,parent_image_urls,image_urls
 
 ---
 
@@ -43,6 +43,7 @@ parent_urlkey,variant_id,variant_row_order,name,info,type,parent_sku,sku,invento
 | `type` | Product category/type e.g. `tshirt`, `jacket`, `pants` | No | _(empty)_ |
 | `parent_sku` | SKU shared across all variants of the same product | Yes | — |
 | `sku` | Unique SKU for this variant | Yes | — |
+| `location_id` | Internal warehouse id | No | _(empty)_ |
 | `inventory_stock` | Stock count | No | _(empty)_ |
 | `cost` | Wholesale cost (number only) | No | _(empty)_ |
 | `cost_currency` | Currency code e.g. `EUR`, `USD` | No | _(empty)_ |
